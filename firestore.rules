@@ -1,0 +1,245 @@
+rules_version = '2';
+
+// Reglas de seguridad. La interfaz oculta opciones por rol, pero ESTE archivo es el que realmente protege los datos.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Funciones de apoyo ----------
+    function autenticado() { return request.auth != null; }
+    function rutaUsuario() { return /databases/$(database)/documents/usuarios/$(request.auth.uid); }
+    function perfil() { return get(rutaUsuario()).data; }
+    function activo() { return autenticado() && exists(rutaUsuario()) && perfil().activo == true; }
+    function esAdmin() { return activo() && perfil().rol == 'administrador'; }
+    function esCoordinador() { return activo() && perfil().rol == 'coordinador'; }
+
+    function correoSesion() { return request.auth.token.email.lower(); }
+    function rolValido(r) { return r in ['administrador', 'coordinador']; }
+
+    // Administrador principal (debe coincidir con adminPrincipal en public/js/firebase-config.js).
+    function esAdminPrincipal() { return autenticado() && correoSesion() == 'comercialdata@centralganadera.com'; }
+
+    // Registro abierto solo para correos corporativos verificados.
+    function esCorreoCorporativo() {
+      return autenticado()
+        && request.auth.token.email_verified == true
+        && correoSesion().matches('^[^@]+@centralganadera[.]com$');
+    }
+
+    function perfilNuevoValido() {
+      return request.resource.data.keys().hasOnly(['nombre', 'correo', 'rol', 'coordinador', 'activo', 'fechaCreacion'])
+        && request.resource.data.correo == correoSesion()
+        && request.resource.data.nombre is string && request.resource.data.nombre.size() > 0
+        && request.resource.data.coordinador is string
+        && request.resource.data.activo == true
+        && request.resource.data.fechaCreacion == request.time;
+    }
+
+    // ---------- Usuarios ----------
+    match /usuarios/{uid} {
+      allow read: if (autenticado() && request.auth.uid == uid) || esAdmin();
+
+      // Primer ingreso: cada persona crea su propio perfil, SIEMPRE como coordinador.
+      allow create: if request.auth.uid == uid && esCorreoCorporativo() && perfilNuevoValido()
+        && request.resource.data.rol == 'coordinador';
+
+      // El administrador principal crea su propio perfil como administrador.
+      allow create: if request.auth.uid == uid && esAdminPrincipal() && perfilNuevoValido()
+        && request.resource.data.rol == 'administrador';
+
+      // Solo el admin modifica perfiles; no puede cambiar el correo ni quitarse a sí mismo el rol o el acceso.
+      allow update: if esAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nombre', 'rol', 'coordinador', 'activo'])
+        && rolValido(request.resource.data.rol)
+        && request.resource.data.activo is bool
+        && (uid != request.auth.uid
+            || (request.resource.data.rol == resource.data.rol && request.resource.data.activo == true));
+
+      allow delete: if false; // nunca se borran: se desactivan
+
+      // El administrador principal recupera su rol si su cuenta existía como coordinador.
+      allow update: if esAdminPrincipal() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rol', 'activo'])
+        && request.resource.data.rol == 'administrador'
+        && request.resource.data.activo == true;
+    }
+
+    // ---------- Clientes (Etapa 2) ----------
+    // Estructura del resultado final (perfil operativo y comercial del cliente).
+    function resultadoFinalValido(d) {
+      return d.keys().hasOnly(['otrasSedes', 'sedes', 'compraGanado', 'tipoBeneficio', 'diasBeneficio',
+          'totalDiasBeneficio', 'horaIngreso', 'horaSalida', 'facturacion', 'preferenciaCanal', 'preferenciaCanalOtro',
+          'observaciones', 'clienteId', 'actualizadoPor', 'actualizadoNombre', 'actualizadoEn', 'ediciones',
+          'creadoPor', 'creadoNombre', 'creadoEn', 'ultimaEdicionOrigen'])
+        && (d.otrasSedes == null || d.otrasSedes is bool)
+        && d.sedes is list && d.sedes.size() <= 20
+        && d.compraGanado is list && d.compraGanado.size() <= 2
+        && (d.tipoBeneficio == null || d.tipoBeneficio in ['BOVINO', 'PORCINO', 'AMBOS'])
+        && d.diasBeneficio is list && d.diasBeneficio.size() <= 6
+        && d.totalDiasBeneficio == d.diasBeneficio.size()
+        && d.horaIngreso is string && d.horaSalida is string
+        && d.facturacion is list && d.facturacion.size() <= 3
+        && (d.preferenciaCanal == null || d.preferenciaCanal in ['REGIONAL', 'PISTOLA', 'SEMI_PISTOLA', 'CORTE_AMERICANO', 'OTRO'])
+        && d.preferenciaCanalOtro is string && d.preferenciaCanalOtro.size() <= 120
+        && d.observaciones is string && d.observaciones.size() <= 2000;
+    }
+
+    match /clientes/{codigo} {
+      allow read: if activo();
+      allow create, update: if esAdmin();
+      allow delete: if false; // los clientes que salen del Excel se marcan inactivos, no se borran
+
+      // Resultado final del cliente: un único documento por cliente que cualquier usuario activo crea o edita.
+      match /perfil/{perfilId} {
+        allow read: if activo();
+        allow create, update: if activo()
+          && perfilId == 'resultadoFinal'
+          && resultadoFinalValido(request.resource.data)
+          && request.resource.data.actualizadoPor == correoSesion()
+          && request.resource.data.actualizadoEn == request.time
+          && request.resource.data.clienteId == codigo
+          // La edición directa desde la ficha (sin visita) es solo del administrador.
+          && (request.resource.data.get('ultimaEdicionOrigen', 'VISITA') != 'FICHA' || esAdmin());
+        allow delete: if false;
+      }
+
+      // Foto de fachada: cualquier usuario activo la puede tomar o reemplazar (una por cliente).
+      match /fotos/{fotoId} {
+        allow read: if activo();
+        allow create, update: if activo()
+          && fotoId == 'fachada'
+          && request.resource.data.keys().hasOnly(['datos', 'ancho', 'alto', 'bytes', 'fechaHora', 'usuario', 'nombre'])
+          && request.resource.data.datos is string
+          && request.resource.data.datos.size() < 700000
+          && request.resource.data.usuario == correoSesion();
+        allow delete: if false;
+      }
+    }
+
+    // Versión de la base de clientes: permite a los dispositivos reutilizar su copia local.
+    match /config/clientes {
+      allow read: if activo();
+      allow write: if esAdmin()
+        && request.resource.data.keys().hasOnly(['version', 'total', 'actualizadoEn'])
+        && request.resource.data.version is int
+        && request.resource.data.total is int;
+    }
+
+    match /importaciones/{id} {
+      allow read, create: if esAdmin();
+      allow update, delete: if false;
+    }
+
+    // ---------- Visitas (Etapas 3-4) ----------
+    function visitaNuevaValida() {
+      let v = request.resource.data;
+      return v.estado == 'PROGRAMADA'
+        && v.vecesReprogramada == 0
+        // Cliente de la base (con código) o prospecto (sin código, con sus datos en `prospecto`).
+        && (v.get('tipoDestinatario', 'CLIENTE') == 'PROSPECTO'
+              ? (v.clienteId == null && v.prospecto is map && v.prospecto.nombre is string && v.prospecto.nombre.size() > 0
+                 && v.tipoVisita == 'VISITA_CLIENTE_PROSPECTO')
+              : (v.clienteId is string && exists(/databases/$(database)/documents/clientes/$(v.clienteId))))
+        && v.coordinadorUid is string && v.coordinadorUid.size() > 0
+        && v.fechaProgramada is string && v.fechaProgramada.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && v.horaProgramada is string && v.horaProgramada.matches('^[0-9]{2}:[0-9]{2}$')
+        && v.fechaOriginal == v.fechaProgramada
+        && v.motivo is string && v.motivo.size() > 0
+        && v.creadoPorUid == request.auth.uid
+        && v.fechaCreacion == request.time;
+    }
+
+    // Debe coincidir con HISTORIAL_COMPARTIDO en public/js/constants.js.
+    // false: cada coordinador solo lee sus visitas. true: puede leer las de otros (historial del cliente completo).
+    function historialCompartido() { return true; }
+
+    function visitaCambioValido() {
+      let antes = resource.data;
+      let v = request.resource.data;
+      return v.clienteId == antes.clienteId
+        && v.get('tipoDestinatario', 'CLIENTE') == antes.get('tipoDestinatario', 'CLIENTE')
+        && v.codigo == antes.codigo
+        && v.fechaOriginal == antes.fechaOriginal
+        && v.horaOriginal == antes.horaOriginal
+        && v.creadoPorUid == antes.creadoPorUid
+        && v.fechaCreacion == antes.fechaCreacion
+        && v.estado in ['PROGRAMADA', 'REPROGRAMADA', 'PENDIENTE', 'FINALIZADA']
+        && v.vecesReprogramada >= antes.vecesReprogramada
+        // La hora real de inicio se guarda una sola vez; solo se libera al reprogramar.
+        && (antes.get('inicioVisita', null) == null
+            || v.get('inicioVisita', null) == antes.get('inicioVisita', null)
+            || v.vecesReprogramada > antes.vecesReprogramada)
+        && v.historial.size() >= antes.historial.size()
+        && v.fechaProgramada.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && v.horaProgramada.matches('^[0-9]{2}:[0-9]{2}$');
+    }
+
+    match /visitas/{visitaId} {
+      allow read: if esAdmin()
+        || (esCoordinador() && (resource.data.coordinadorUid == request.auth.uid || historialCompartido()));
+      // Toda visita nace PROGRAMADA, para un cliente existente y con fecha/hora válidas.
+      // El coordinador solo puede crear visitas a su nombre; el administrador, para cualquier coordinador.
+      allow create: if visitaNuevaValida()
+        && (esAdmin() || (esCoordinador() && request.resource.data.coordinadorUid == request.auth.uid));
+      // Cambios (editar, reprogramar, resultado): nunca se pierde la trazabilidad.
+      // El coordinador no puede reasignar la visita ni modificar una ya finalizada.
+      allow update: if visitaCambioValido()
+        && (esAdmin()
+            || (esCoordinador()
+                && resource.data.coordinadorUid == request.auth.uid
+                && request.resource.data.coordinadorUid == request.auth.uid
+                && resource.data.estado != 'FINALIZADA'));
+      // Solo una visita agendada por error: sin iniciar y sin resultado. La borra su responsable o el admin.
+      allow delete: if resource.data.estado in ['PROGRAMADA', 'REPROGRAMADA']
+        && resource.data.get('inicioVisita', null) == null
+        && !('resultado' in resource.data)
+        && (esAdmin() || (esCoordinador() && resource.data.coordinadorUid == request.auth.uid));
+
+      // Fotos en subcolección para no descargarlas al listar visitas.
+      match /fotos/{fotoId} {
+        function visita() { return get(/databases/$(database)/documents/visitas/$(visitaId)).data; }
+        allow read: if esAdmin() || (esCoordinador() && (visita().coordinadorUid == request.auth.uid || historialCompartido()));
+        allow create, update: if (esAdmin() || (esCoordinador() && visita().coordinadorUid == request.auth.uid))
+          && request.resource.data.datos is string
+          && request.resource.data.datos.size() < 700000;
+        allow delete: if false;
+      }
+    }
+
+    // ---------- Actualizaciones del cliente ----------
+    // El coordinador reporta cambios (nueva sede, dirección, teléfono…). No modifican la ficha: quedan "reportada"
+    // con el valor anterior y el nuevo. Solo el administrador cambia su estado (revisada / aplicada). Nunca se borran.
+    function actualizacionNuevaValida() {
+      let a = request.resource.data;
+      return a.keys().hasOnly(['clienteId', 'codigo', 'clienteNombre', 'visitaId', 'lote', 'tipoActualizacion', 'tipoTexto',
+          'campoAfectado', 'valorAnterior', 'valorNuevo', 'detalle', 'observacion', 'estado',
+          'reportadoPorUid', 'reportadoPor', 'reportadoNombre', 'fechaReporte', 'fechaReporteLocal'])
+        && a.clienteId is string && exists(/databases/$(database)/documents/clientes/$(a.clienteId))
+        && (a.visitaId == null || a.visitaId is string)
+        && a.tipoActualizacion in ['NUEVA_SEDE', 'SEDE_CERRADA', 'DIRECCION', 'TELEFONO', 'RESPONSABLE', 'NUEVA_MARCA',
+            'MARCA', 'DIAS_BENEFICIO', 'TIPO_BENEFICIO', 'COMERCIAL', 'CORRECCION', 'OTRO']
+        && a.valorAnterior is string && a.valorAnterior.size() <= 1000
+        && a.valorNuevo is string && a.valorNuevo.size() <= 1000
+        && a.detalle is map
+        && a.observacion is string && a.observacion.size() <= 2000
+        && a.estado == 'reportada'
+        && a.reportadoPorUid == request.auth.uid
+        && a.reportadoPor == correoSesion()
+        && a.fechaReporte == request.time;
+    }
+
+    match /actualizacionesCliente/{id} {
+      allow read: if activo();
+      allow create: if activo() && actualizacionNuevaValida();
+      allow update: if esAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado', 'revisadoPor', 'revisadoNombre', 'revisadoEn',
+            'aplicadoPor', 'aplicadoNombre', 'aplicadoEn', 'notaRevision'])
+        && request.resource.data.estado in ['reportada', 'revisada', 'aplicada'];
+      allow delete: if false;
+    }
+
+    // Cualquier otra ruta queda cerrada.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
